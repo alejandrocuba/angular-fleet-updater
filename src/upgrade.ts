@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises';
+import { access, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { FleetRepoConfig } from './config.js';
 import {
@@ -8,6 +8,18 @@ import {
   type CommandOptions,
   type CommandResult,
 } from './exec.js';
+import {
+  discardWorktreeChanges,
+  getDirtyFiles,
+  stashWorktreeChanges,
+} from './git.js';
+import {
+  createCommandStreamCallbacks,
+  type DirtyTreeAction,
+  type RepoTaskLogger,
+} from './ui.js';
+
+export type ProjectFramework = 'angular' | 'analog';
 
 export interface AngularVersionInfo {
   rawRange: string;
@@ -22,6 +34,7 @@ export interface LatestAngularInfo {
 export interface DryRunRepoReport {
   name: string;
   localPath: string;
+  framework: ProjectFramework;
   currentRaw: string | null;
   currentMajor: number | null;
   latestVersion: string;
@@ -36,13 +49,18 @@ export interface VerificationGateResult {
   ok: boolean;
   failedStep?: 'build' | 'test';
   logs: string;
+  failedStepLogs?: string;
   exitCode: number | null;
 }
 
 export interface DeterministicUpgradeResult {
   ok: boolean;
+  framework?: ProjectFramework;
   failedStep?: 'install' | 'ng-update' | 'build' | 'test';
+  skippedByUser?: boolean;
+  cancelledByUser?: boolean;
   logs: string;
+  failedStepLogs?: string;
   exitCode: number | null;
   nodeVersion: string | null;
 }
@@ -112,6 +130,35 @@ export function extractAngularCoreVersion(
     rawRange: rawValue,
     major,
   };
+}
+
+export function detectProjectFramework(
+  packageJsonContent: string,
+): ProjectFramework {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(packageJsonContent) as unknown;
+  } catch {
+    return 'angular';
+  }
+
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return 'angular';
+  }
+
+  const record = parsed as Record<string, unknown>;
+  for (const sectionName of ['dependencies', 'devDependencies'] as const) {
+    const section = record[sectionName];
+    if (typeof section === 'object' && section !== null && !Array.isArray(section)) {
+      for (const pkgName of Object.keys(section as Record<string, unknown>)) {
+        if (pkgName === '@analogjs/platform' || pkgName.startsWith('@analogjs/')) {
+          return 'analog';
+        }
+      }
+    }
+  }
+
+  return 'angular';
 }
 
 export async function fetchLatestAngularVersion(
@@ -217,6 +264,41 @@ export async function runInRepoEnv(
   });
 }
 
+async function runStreamedStep(
+  repoLogger: RepoTaskLogger | undefined,
+  label: string,
+  cwd: string,
+  nodeVersion: string | null,
+  shellCommand: string,
+): Promise<CommandResult> {
+  const stepGroup = repoLogger?.startGroup(`${label}: ${shellCommand}`);
+  const stream = repoLogger
+    ? createCommandStreamCallbacks(repoLogger.repoName, (line, isErr) => {
+        stepGroup?.message(isErr ? `[stderr] ${line}` : line);
+      })
+    : undefined;
+
+  try {
+    const result = await runInRepoEnv(cwd, nodeVersion, shellCommand, {
+      ...(stream ? { onStdout: stream.onStdout, onStderr: stream.onStderr } : {}),
+    });
+    stream?.flush();
+    if (stepGroup) {
+      const secs = (result.durationMs / 1000).toFixed(1);
+      if (result.exitCode === 0) {
+        stepGroup.success(`${label} passed in ${secs}s`);
+      } else {
+        stepGroup.error(`${label} failed (exit ${result.exitCode ?? 'null'}) in ${secs}s`);
+      }
+    }
+    return result;
+  } catch (error) {
+    stream?.flush();
+    stepGroup?.error(`${label} error`);
+    throw error;
+  }
+}
+
 function formatStepLog(command: string, result: CommandResult): string {
   const statusLine = result.timedOut
     ? `[timed out after ${result.durationMs}ms]`
@@ -229,28 +311,45 @@ export async function runVerificationGate(
   nodeVersion: string | null,
   buildCommand: string,
   testCommand?: string,
+  repoLogger?: RepoTaskLogger,
 ): Promise<VerificationGateResult> {
   const logChunks: string[] = [];
 
-  const buildResult = await runInRepoEnv(cwd, nodeVersion, buildCommand);
-  logChunks.push(formatStepLog(buildCommand, buildResult));
+  const buildResult = await runStreamedStep(
+    repoLogger,
+    'Build verification',
+    cwd,
+    nodeVersion,
+    buildCommand,
+  );
+  const buildLog = formatStepLog(buildCommand, buildResult);
+  logChunks.push(buildLog);
   if (buildResult.exitCode !== 0) {
     return {
       ok: false,
       failedStep: 'build',
       logs: logChunks.join('\n'),
+      failedStepLogs: buildLog,
       exitCode: buildResult.exitCode,
     };
   }
 
   if (testCommand) {
-    const testResult = await runInRepoEnv(cwd, nodeVersion, testCommand);
-    logChunks.push(formatStepLog(testCommand, testResult));
+    const testResult = await runStreamedStep(
+      repoLogger,
+      'Test verification',
+      cwd,
+      nodeVersion,
+      testCommand,
+    );
+    const testLog = formatStepLog(testCommand, testResult);
+    logChunks.push(testLog);
     if (testResult.exitCode !== 0) {
       return {
         ok: false,
         failedStep: 'test',
         logs: logChunks.join('\n'),
+        failedStepLogs: testLog,
         exitCode: testResult.exitCode,
       };
     }
@@ -263,37 +362,294 @@ export async function runVerificationGate(
   };
 }
 
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function ensureAngularPnpmPackageManager(
+  worktreePath: string,
+  nodeVersion: string | null,
+  repoLogger?: RepoTaskLogger,
+): Promise<boolean> {
+  const angularJsonPath = path.join(worktreePath, 'angular.json');
+  let raw: string;
+  try {
+    raw = await readFile(angularJsonPath, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return false;
+    }
+    throw error;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    return false;
+  }
+
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return false;
+  }
+
+  const record = parsed as Record<string, unknown>;
+  const existingCli =
+    typeof record['cli'] === 'object' &&
+    record['cli'] !== null &&
+    !Array.isArray(record['cli'])
+      ? (record['cli'] as Record<string, unknown>)
+      : undefined;
+
+  if (existingCli?.['packageManager'] === 'pnpm') {
+    return false;
+  }
+
+  const hasPnpmLock = await fileExists(path.join(worktreePath, 'pnpm-lock.yaml'));
+  const hasNpm = await commandExists('npm');
+  if (!hasPnpmLock && hasNpm) {
+    return false;
+  }
+
+  let updatedViaCli = false;
+  try {
+    const cliResult = await runInRepoEnv(
+      worktreePath,
+      nodeVersion,
+      'pnpm exec ng config cli.packageManager pnpm',
+    );
+    updatedViaCli = cliResult.exitCode === 0;
+  } catch {
+    updatedViaCli = false;
+  }
+
+  if (!updatedViaCli) {
+    const nextCli = existingCli ? { ...existingCli } : {};
+    nextCli['packageManager'] = 'pnpm';
+    record['cli'] = nextCli;
+    await writeFile(angularJsonPath, `${JSON.stringify(record, null, 2)}\n`, 'utf8');
+  }
+
+  repoLogger?.message('Configured Angular CLI packageManager to "pnpm" in angular.json');
+  return true;
+}
+
+async function detectFrameworkFromWorktree(
+  worktreePath: string,
+): Promise<ProjectFramework> {
+  try {
+    const raw = await readFile(path.join(worktreePath, 'package.json'), 'utf8');
+    return detectProjectFramework(raw);
+  } catch {
+    return 'angular';
+  }
+}
+
+async function runUpgradeCommandSequence(
+  worktreePath: string,
+  nodeVersion: string | null,
+  framework: ProjectFramework,
+  targetMajor: number,
+  allowDirty: boolean,
+  repoLogger: RepoTaskLogger | undefined,
+  logChunks: string[],
+): Promise<
+  { ok: true } | { ok: false; exitCode: number | null; failedStepLogs: string }
+> {
+  const runStep = async (
+    label: string,
+    command: string,
+  ): Promise<{ exitCode: number | null; stepLog: string }> => {
+    const result = await runStreamedStep(
+      repoLogger,
+      label,
+      worktreePath,
+      nodeVersion,
+      command,
+    );
+    const stepLog = formatStepLog(command, result);
+    logChunks.push(stepLog);
+    return { exitCode: result.exitCode, stepLog };
+  };
+
+  if (framework === 'analog') {
+    const isNx = await fileExists(path.join(worktreePath, 'nx.json'));
+    if (isNx) {
+      const migrateResult = await runStep(
+        'Analog migrate (Nx) -> @analogjs/platform@latest',
+        'pnpm exec nx migrate @analogjs/platform@latest',
+      );
+      if (migrateResult.exitCode !== 0) {
+        return {
+          ok: false,
+          exitCode: migrateResult.exitCode,
+          failedStepLogs: migrateResult.stepLog,
+        };
+      }
+
+      const reinstallResult = await runStep(
+        'Install migrated dependencies',
+        'pnpm install --no-frozen-lockfile',
+      );
+      if (reinstallResult.exitCode !== 0) {
+        return {
+          ok: false,
+          exitCode: reinstallResult.exitCode,
+          failedStepLogs: reinstallResult.stepLog,
+        };
+      }
+
+      if (await fileExists(path.join(worktreePath, 'migrations.json'))) {
+        const applyResult = await runStep(
+          'Run Analog Nx migrations',
+          'pnpm exec nx migrate --run-migrations',
+        );
+        if (applyResult.exitCode !== 0) {
+          return {
+            ok: false,
+            exitCode: applyResult.exitCode,
+            failedStepLogs: applyResult.stepLog,
+          };
+        }
+      }
+
+      return { ok: true };
+    }
+
+    const analogUpdateCommand = `pnpm exec ng update @analogjs/platform@latest${allowDirty ? ' --allow-dirty' : ''}`;
+    const analogUpdateResult = await runStep(
+      'Analog update -> @analogjs/platform@latest',
+      analogUpdateCommand,
+    );
+    return analogUpdateResult.exitCode === 0
+      ? { ok: true }
+      : {
+          ok: false,
+          exitCode: analogUpdateResult.exitCode,
+          failedStepLogs: analogUpdateResult.stepLog,
+        };
+  }
+
+  const updateCommand = `pnpm exec ng update @angular/core@${targetMajor} @angular/cli@${targetMajor}${allowDirty ? ' --allow-dirty' : ''}`;
+  const updateResult = await runStep(
+    `Angular update -> v${targetMajor}`,
+    updateCommand,
+  );
+  return updateResult.exitCode === 0
+    ? { ok: true }
+    : {
+        ok: false,
+        exitCode: updateResult.exitCode,
+        failedStepLogs: updateResult.stepLog,
+      };
+}
+
 export async function runDeterministicUpgrade(
   worktreePath: string,
   targetMajor: number,
   buildCommand: string,
   testCommand?: string,
+  repoLogger?: RepoTaskLogger,
+  resolveDirtyTree?: (dirtyFiles: string[]) => Promise<DirtyTreeAction>,
 ): Promise<DeterministicUpgradeResult> {
-  const nodeVersion = await detectNodeVersion(worktreePath);
+  const [nodeVersion, framework] = await Promise.all([
+    detectNodeVersion(worktreePath),
+    detectFrameworkFromWorktree(worktreePath),
+  ]);
   const logChunks: string[] = [];
 
   const installCommand = 'pnpm install --no-frozen-lockfile';
-  const installResult = await runInRepoEnv(worktreePath, nodeVersion, installCommand);
-  logChunks.push(formatStepLog(installCommand, installResult));
+  const installResult = await runStreamedStep(
+    repoLogger,
+    'Install dependencies',
+    worktreePath,
+    nodeVersion,
+    installCommand,
+  );
+  const installLog = formatStepLog(installCommand, installResult);
+  logChunks.push(installLog);
   if (installResult.exitCode !== 0) {
     return {
       ok: false,
+      framework,
       failedStep: 'install',
       logs: logChunks.join('\n'),
+      failedStepLogs: installLog,
       exitCode: installResult.exitCode,
       nodeVersion,
     };
   }
 
-  const updateCommand = `pnpm exec ng update @angular/core@${targetMajor} @angular/cli@${targetMajor} --allow-dirty --force`;
-  const updateResult = await runInRepoEnv(worktreePath, nodeVersion, updateCommand);
-  logChunks.push(formatStepLog(updateCommand, updateResult));
-  if (updateResult.exitCode !== 0) {
+  await ensureAngularPnpmPackageManager(worktreePath, nodeVersion, repoLogger);
+
+  const dirtyFiles = await getDirtyFiles(worktreePath);
+  let allowDirty = false;
+
+  if (dirtyFiles.length > 0) {
+    const action = resolveDirtyTree
+      ? await resolveDirtyTree(dirtyFiles)
+      : 'allow-dirty';
+
+    if (action === 'allow-dirty') {
+      allowDirty = true;
+      repoLogger?.message(
+        `Worktree has ${dirtyFiles.length} uncommitted change(s); running ng update with --allow-dirty`,
+      );
+    } else if (action === 'discard') {
+      repoLogger?.message(
+        `Discarding ${dirtyFiles.length} uncommitted change(s) in worktree before ng update...`,
+      );
+      await discardWorktreeChanges(worktreePath);
+    } else if (action === 'stash') {
+      repoLogger?.message(
+        `Stashing ${dirtyFiles.length} uncommitted change(s) in worktree before ng update...`,
+      );
+      await stashWorktreeChanges(worktreePath);
+    } else if (action === 'skip') {
+      repoLogger?.message('Skipping repository due to dirty git worktree.');
+      return {
+        ok: false,
+        framework,
+        skippedByUser: true,
+        logs: logChunks.join('\n'),
+        exitCode: 0,
+        nodeVersion,
+      };
+    } else {
+      repoLogger?.message('Upgrade cancelled by user due to dirty git worktree.');
+      return {
+        ok: false,
+        framework,
+        cancelledByUser: true,
+        logs: logChunks.join('\n'),
+        exitCode: 130,
+        nodeVersion,
+      };
+    }
+  }
+
+  const updateSequence = await runUpgradeCommandSequence(
+    worktreePath,
+    nodeVersion,
+    framework,
+    targetMajor,
+    allowDirty,
+    repoLogger,
+    logChunks,
+  );
+  if (!updateSequence.ok) {
     return {
       ok: false,
+      framework,
       failedStep: 'ng-update',
       logs: logChunks.join('\n'),
-      exitCode: updateResult.exitCode,
+      failedStepLogs: updateSequence.failedStepLogs,
+      exitCode: updateSequence.exitCode,
       nodeVersion,
     };
   }
@@ -303,13 +659,18 @@ export async function runDeterministicUpgrade(
     nodeVersion,
     buildCommand,
     testCommand,
+    repoLogger,
   );
   logChunks.push(verification.logs);
 
   return {
     ok: verification.ok,
+    framework,
     ...(verification.failedStep ? { failedStep: verification.failedStep } : {}),
     logs: logChunks.join('\n'),
+    ...(!verification.ok && verification.failedStepLogs
+      ? { failedStepLogs: verification.failedStepLogs }
+      : {}),
     exitCode: verification.exitCode,
     nodeVersion,
   };
@@ -326,11 +687,13 @@ export async function analyzeRepoDryRun(
       detectNodeVersion(repo.localPath),
     ]);
 
+    const framework = detectProjectFramework(packageJsonContent);
     const angularInfo = extractAngularCoreVersion(packageJsonContent);
     if (!angularInfo) {
       return {
         name: repo.name,
         localPath: repo.localPath,
+        framework,
         currentRaw: null,
         currentMajor: null,
         latestVersion: latest.version,
@@ -346,6 +709,7 @@ export async function analyzeRepoDryRun(
       return {
         name: repo.name,
         localPath: repo.localPath,
+        framework,
         currentRaw: angularInfo.rawRange,
         currentMajor: angularInfo.major,
         latestVersion: latest.version,
@@ -359,6 +723,7 @@ export async function analyzeRepoDryRun(
     return {
       name: repo.name,
       localPath: repo.localPath,
+      framework,
       currentRaw: angularInfo.rawRange,
       currentMajor: angularInfo.major,
       latestVersion: latest.version,
@@ -372,6 +737,7 @@ export async function analyzeRepoDryRun(
     return {
       name: repo.name,
       localPath: repo.localPath,
+      framework: 'angular',
       currentRaw: null,
       currentMajor: null,
       latestVersion: latest.version,

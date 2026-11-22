@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { lstat, mkdir, readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { commandExists, runCommand } from './exec.js';
+import type { ProjectFramework } from './upgrade.js';
 
 export const WORKTREE_ROOT = '/tmp/ng-fleet';
 
@@ -12,6 +13,7 @@ export interface PrDeliveryParams {
   repoName: string;
   branchName: string;
   baseRef: string;
+  framework?: ProjectFramework;
   currentMajor: number;
   targetMajor: number;
   agentIntervened: boolean;
@@ -148,6 +150,17 @@ export async function createWorktree(
   return worktreePath;
 }
 
+export async function deleteLocalBranch(
+  localPath: string,
+  branchName: string,
+): Promise<void> {
+  try {
+    await runCommand('git', ['branch', '-D', branchName], { cwd: localPath });
+  } catch {
+    // Best-effort cleanup; ignore missing or checked-out branch errors.
+  }
+}
+
 export async function withIsolatedWorktree<T>(
   localPath: string,
   repoName: string,
@@ -156,10 +169,24 @@ export async function withIsolatedWorktree<T>(
   fn: (worktreePath: string) => Promise<T>,
 ): Promise<T> {
   const worktreePath = await createWorktree(localPath, repoName, branchName, baseRef);
+  let failed = false;
   try {
     return await fn(worktreePath);
+  } catch (error) {
+    failed = true;
+    throw error;
   } finally {
+    if (failed) {
+      try {
+        await discardWorktreeChanges(worktreePath);
+      } catch {
+        // Best-effort cleanup before removing the worktree.
+      }
+    }
     await removeWorktree(localPath, worktreePath);
+    if (failed) {
+      await deleteLocalBranch(localPath, branchName);
+    }
   }
 }
 
@@ -171,9 +198,52 @@ export async function getHeadSha(worktreePath: string): Promise<string> {
   return result.stdout.trim();
 }
 
+const EXCLUDED_LOCKFILES = [
+  'pnpm-lock.yaml',
+  'package-lock.json',
+  'yarn.lock',
+  'bun.lockb',
+] as const;
+
+const EXCLUDED_BINARY_EXTENSIONS = [
+  '.png',
+  '.jpg',
+  '.jpeg',
+  '.gif',
+  '.webp',
+  '.svg',
+  '.ico',
+  '.avif',
+  '.woff',
+  '.woff2',
+  '.ttf',
+  '.eot',
+  '.pdf',
+  '.mp4',
+  '.mov',
+  '.zip',
+] as const;
+
+const DIFF_EXCLUDE_PATHSPECS = [
+  ...EXCLUDED_LOCKFILES.flatMap((name) => [`:!${name}`, `:!*/${name}`]),
+  ...EXCLUDED_BINARY_EXTENSIONS.flatMap((ext) => [`:!*${ext}`, `:!*${ext.toUpperCase()}`]),
+];
+
+function isExcludedFromDiff(filePath: string): boolean {
+  const normalized = filePath.replaceAll('\\', '/');
+  const base = path.posix.basename(normalized).toLowerCase();
+  if ((EXCLUDED_LOCKFILES as readonly string[]).includes(base)) {
+    return true;
+  }
+  const ext = path.posix.extname(base);
+  return (EXCLUDED_BINARY_EXTENSIONS as readonly string[]).includes(ext);
+}
+
 export async function getGitDiff(worktreePath: string): Promise<string> {
   const [trackedDiff, untrackedFiles] = await Promise.all([
-    runCommand('git', ['diff'], { cwd: worktreePath }),
+    runCommand('git', ['diff', '--', '.', ...DIFF_EXCLUDE_PATHSPECS], {
+      cwd: worktreePath,
+    }),
     runCommand('git', ['ls-files', '--others', '--exclude-standard'], {
       cwd: worktreePath,
     }),
@@ -188,7 +258,7 @@ export async function getGitDiff(worktreePath: string): Promise<string> {
   const untracked = untrackedFiles.stdout
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .filter((line) => line.length > 0);
+    .filter((line) => line.length > 0 && !isExcludedFromDiff(line));
 
   if (untracked.length > 0) {
     sections.push(`Untracked files:\n${untracked.map((file) => `  + ${file}`).join('\n')}`);
@@ -284,11 +354,72 @@ export async function hasPendingChanges(worktreePath: string): Promise<boolean> 
   return result.exitCode === 0 && result.stdout.trim().length > 0;
 }
 
+export async function getDirtyFiles(worktreePath: string): Promise<string[]> {
+  const result = await runCommand('git', ['status', '--porcelain'], {
+    cwd: worktreePath,
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `git status failed in "${worktreePath}": ${result.combined.trim()}`,
+    );
+  }
+
+  return result.stdout
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\r$/, ''))
+    .filter((line) => line.trim().length > 0);
+}
+
+export async function discardWorktreeChanges(worktreePath: string): Promise<void> {
+  const resetResult = await runCommand('git', ['reset', '--hard', 'HEAD'], {
+    cwd: worktreePath,
+  });
+  if (resetResult.exitCode !== 0) {
+    throw new Error(
+      `git reset --hard HEAD failed in "${worktreePath}": ${resetResult.combined.trim()}`,
+    );
+  }
+
+  // Omit -x so gitignored dependencies (e.g. node_modules) remain intact.
+  const cleanResult = await runCommand('git', ['clean', '-fd'], {
+    cwd: worktreePath,
+  });
+  if (cleanResult.exitCode !== 0) {
+    throw new Error(
+      `git clean -fd failed in "${worktreePath}": ${cleanResult.combined.trim()}`,
+    );
+  }
+}
+
+export async function stashWorktreeChanges(worktreePath: string): Promise<void> {
+  const result = await runCommand(
+    'git',
+    [
+      'stash',
+      'push',
+      '--include-untracked',
+      '-m',
+      'angular-fleet-updater: pre-ng-update',
+    ],
+    { cwd: worktreePath },
+  );
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `git stash push failed in "${worktreePath}": ${result.combined.trim()}`,
+    );
+  }
+}
+
 function buildPrBody(params: PrDeliveryParams): string {
+  const upgradeLine =
+    params.framework === 'analog'
+      ? `- **Upgrade Path:** Analog (\`@analogjs/platform@latest\`) for Angular **v${params.currentMajor} -> v${params.targetMajor}**`
+      : `- **Upgrade Path:** \`@angular/core\` & \`@angular/cli\` **v${params.currentMajor} -> v${params.targetMajor}**`;
+
   const lines: string[] = [
     `## Angular Fleet Upgrade: \`${params.repoName}\``,
     '',
-    `- **Upgrade Path:** \`@angular/core\` & \`@angular/cli\` **v${params.currentMajor} -> v${params.targetMajor}**`,
+    upgradeLine,
     `- **Base Ref:** \`${params.baseRef}\``,
     `- **Mode:** ${params.agentIntervened ? 'Deterministic upgrade + Bounded AI Remediation (Draft PR)' : 'Deterministic upgrade'}`,
     '- **Verification Gate:** Passed (`exit 0`)',

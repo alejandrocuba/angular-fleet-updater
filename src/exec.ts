@@ -16,6 +16,8 @@ export interface CommandOptions {
   timeoutMs?: number;
   stdin?: string;
   maxCombinedBytes?: number;
+  onStdout?: (chunk: string) => void;
+  onStderr?: (chunk: string) => void;
 }
 
 const DEFAULT_MAX_BYTES = 2 * 1024 * 1024;
@@ -143,11 +145,13 @@ export async function runCommand(
     child.stdout.on('data', (chunk: Buffer) => {
       stdoutTail.append(chunk);
       combinedTail.append(chunk);
+      options.onStdout?.(chunk.toString('utf8'));
     });
 
     child.stderr.on('data', (chunk: Buffer) => {
       stderrTail.append(chunk);
       combinedTail.append(chunk);
+      options.onStderr?.(chunk.toString('utf8'));
     });
 
     // Avoid unhandled stream errors when the child exits before draining stdin.

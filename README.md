@@ -19,7 +19,7 @@ A local TypeScript CLI implementing the **Deterministic-First, Agent-Fallback** 
 - `src/index.ts` — CLI entry point (`--dry-run`, `--config`, `--timeout`, `--agent-cmd`, `--latest-version`, `--help`) and per-repo orchestration + final summary report.
 - `src/config.ts` — Loads and strictly validates `fleet.json`.
 - `src/git.ts` — Performs `git fetch origin`, resolves `origin/main` or `origin/master`, manages isolated worktrees under `/tmp/ng-fleet/<name>` with guaranteed `try / finally` cleanup, computes workspace diffs, and delivers PRs via `git` + `gh`.
-- `src/upgrade.ts` — Detects `.nvmrc` / `.node-version` for `fnm exec`, compares `@angular/core` against `pnpm view @angular/core version`, runs `pnpm install --no-frozen-lockfile`, `pnpm exec ng update @angular/core@<targetMajor> @angular/cli@<targetMajor> --allow-dirty --force`, and enforces the build/test verification gate.
+- `src/upgrade.ts` — Detects `.nvmrc` / `.node-version` for `fnm exec`, compares `@angular/core` against `pnpm view @angular/core version`, runs `pnpm install --no-frozen-lockfile`, `pnpm exec ng update @angular/core@<targetMajor> @angular/cli@<targetMajor>`, and enforces the build/test verification gate.
 - `src/agent.ts` — Headless bounded fallback agent runner invoked strictly when `ng update`, `buildCommand`, or `testCommand` fails, enforcing timeouts, git `HEAD` immutability, and AI-modified file tracking.
 - `src/exec.ts` — Subprocess spawning, process-group timeout escalation, and bounded log tail utilities.
 - `prompts/remediation.md` — Strict Angular migration remediation prompt forbidding downgrades, `@ts-ignore`/`@ts-nocheck`, ESLint disables, test deletion/skipping, and git mutations.
