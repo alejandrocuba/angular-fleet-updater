@@ -1,0 +1,18 @@
+{
+  "name": "angular-fleet-updater",
+  "version": "1.0.0",
+  "description": "Deterministic-First, Agent-Fallback CLI to upgrade multiple local Angular repositories via isolated git worktrees.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dry-run": "tsx src/index.ts --dry-run",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
