@@ -2,6 +2,19 @@
 
 A local TypeScript CLI implementing the **Deterministic-First, Agent-Fallback** pattern to safely upgrade multiple local Angular repositories by one major version at a time using isolated `git worktree` sandboxes.
 
+## Quick Start
+
+1. Verify `fleet.json` lists the Angular repositories you want to update (`name`, `localPath`, and optional `buildCommand` / `testCommand`).
+2. Preview pending upgrades (read-only):
+   ```bash
+   pnpm run dry-run
+   ```
+3. Run the upgrades and open PRs:
+   ```bash
+   pnpm start
+   ```
+   *(If `npm` is not on your `PATH`, pass `-- --latest-version <semver>`, e.g. `pnpm run dry-run -- --latest-version 22.0.0`.)*
+
 ## Architecture
 
 - `src/index.ts` — CLI entry point (`--dry-run`, `--config`, `--timeout`, `--agent-cmd`, `--latest-version`, `--help`) and per-repo orchestration + final summary report.
@@ -27,9 +40,16 @@ A local TypeScript CLI implementing the **Deterministic-First, Agent-Fallback** 
    pnpm install
    ```
 
-2. Create `fleet.json` from the example:
-   ```bash
-   cp fleet.example.json fleet.json
+2. Create or update `fleet.json` with an array of repository entries:
+   ```json
+   [
+     {
+       "name": "my-app",
+       "localPath": "/abs/path/to/my-app",
+       "buildCommand": "pnpm run build",
+       "testCommand": "pnpm test -- --watch=false"
+     }
+   ]
    ```
 
 3. Run a read-only dry run across your fleet:
