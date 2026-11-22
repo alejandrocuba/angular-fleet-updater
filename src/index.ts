@@ -54,7 +54,7 @@ Options:
   --config <path>            Path to fleet config JSON (default: ./fleet.json)
   --timeout <seconds>        Agent remediation timeout per repository in seconds (default: ${DEFAULT_AGENT_TIMEOUT_MS / 1000})
   --agent-cmd <command>      Override local headless agent command (receives prompt via stdin)
-  --latest-version <semver>  Override latest @angular/core version check instead of running npm view
+  --latest-version <semver>  Override latest @angular/core version check instead of running pnpm view
   -h, --help                 Show this help message
 `);
 }

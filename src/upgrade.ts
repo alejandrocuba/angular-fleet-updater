@@ -127,17 +127,17 @@ export async function fetchLatestAngularVersion(
     return { version, major };
   }
 
-  const result = await runCommand('npm', ['view', '@angular/core', 'version']);
+  const result = await runCommand('pnpm', ['view', '@angular/core', 'version']);
   if (result.exitCode !== 0) {
     throw new Error(
-      `Failed to query latest @angular/core version via npm (exit ${result.exitCode}):\n${result.combined.trim()}`,
+      `Failed to query latest @angular/core version via pnpm (exit ${result.exitCode}):\n${result.combined.trim()}`,
     );
   }
 
   const version = result.stdout.trim();
   const major = parseMajorVersion(version);
   if (major === null) {
-    throw new Error(`Unexpected "npm view @angular/core version" output: "${version}".`);
+    throw new Error(`Unexpected "pnpm view @angular/core version" output: "${version}".`);
   }
 
   return { version, major };
